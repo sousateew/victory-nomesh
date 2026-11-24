@@ -1,3 +1,66 @@
+# VIctory on an RX 580 2048SP (Polaris, no mesh shaders, wave64 only)
+
+This repository carries a few changes on top of
+[victory-gta6](https://github.com/fxceless/victory-gta6) so that the Xbox
+Series build of Grand Theft Auto VI runs through VIctory on an AMD Radeon
+RX 580 2048SP, an RX 570-class Polaris GPU (DXGI reports "Radeon RX 570
+Series", 8 GB). The driver for this card has no mesh shaders, and its waves
+are always 64 lanes wide (WaveLaneCountMin = Max = 64).
+
+**This repository contains no game files, code or assets.** You need your own
+copy of the game. It is not affiliated with or endorsed by Rockstar Games or
+Take-Two Interactive.
+
+### Credits
+
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
+  contributors: the base of everything here.
+- **[victory-gta6](https://github.com/fxceless/victory-gta6)** by fxceless:
+  the fork these changes sit on. Its README follows below, unchanged.
+- Licensed GPL-3.0-or-later, like both of the above. The full history of both
+  is kept.
+- The changes in this repository were developed with
+  [Claude Code](https://claude.com/claude-code).
+
+### What the changes do
+
+| Commit | Change |
+|--------|--------|
+| `a2d095d` | Mesh shader fallback for hosts without mesh shaders: each mesh (and amplification) program runs as a compute pass that writes vertices and primitives to buffers, which an ordinary vertex draw then renders. |
+| `98c7cf2` | Indirect mesh dispatches (mesh dispatch arguments read from a GPU buffer) also go through the fallback. |
+| `0173a62` | The fallback's mesh record SRV moved from slot 255 to 252; 255 collided with `SLOT_STRIDES`. |
+| `aa5f0da` | Console compute shaders written for 32-lane waves run two to a 64-lane host wave, without `WaveSize(32)` (which this GPU does not support). |
+
+### Current state (2026-11-24)
+
+- The game reaches gameplay. The first in-world image is a sunlit room.
+- About 1 frame per second.
+- Shadowed areas are black (see the fork's notes on ray-traced lighting below).
+- Memory grows during gameplay: 24 GB of RAM is needed, and it is still not
+  enough for long runs.
+- The 1280x720 display mode can hang; use 1920x1080.
+
+### Running
+
+Build and configure as described further below (your own game files, a
+`victory.toml` pointing at them), then set these environment variables before
+`victory.exe run ...` (PowerShell):
+
+```powershell
+$env:VICTORY_MESH_FALLBACK = "1"
+$env:VICTORY_DISPLAY_MODE = "1920x1080"
+$env:VICTORY_TEXTURE_NO_WAIT = "1"
+target\release\victory.exe run <game dir>\<the title's exe> --execute
+```
+
+Optional, pick one:
+
+- add `VICTORY_RELAY=2`, or
+- without `VICTORY_RELAY`, add `VICTORY_INPLACE=2` and
+  `VICTORY_TEXTURE_BUDGET_MB=1500`.
+
+---
+
 # victory-gta6
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), the
