@@ -16,7 +16,7 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// mesh program run as compute) and `t0` (read by its vertex shader).
 pub const MESH_RECORD_SPACE: u32 = 2;
 /// The `root_srvs` entry standing for the record buffer's `t0`.
-pub(crate) const RECORD_SRV_SLOT: u8 = u8::MAX;
+pub(crate) const RECORD_SRV_SLOT: u8 = 252;
 
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
