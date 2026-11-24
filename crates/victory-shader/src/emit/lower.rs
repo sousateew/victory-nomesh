@@ -264,6 +264,11 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// Console wave32 compute code with console lanes on a host whose waves
+    /// are 64 lanes only: no `WaveSize`; each host wave holds two console
+    /// waves (lanes 0..31 and 32..63), and lane indices, lane reads, ballots
+    /// and first-lane reads stay inside this lane's half.
+    pack32: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh as compute: the group's record's byte offset (entry block).
@@ -1059,6 +1064,23 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+/// The narrowest wave the host GPU runs (0: not known); see [`set_host_min_wave`].
+static HOST_MIN_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The host GPU's `WaveLaneCountMin`: 64 (Polaris and older AMD) refuses
+/// `WaveSize(32)`, so console wave32 programs run two to a host wave instead.
+pub fn set_host_min_wave(lanes: u32) {
+    HOST_MIN_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn host_min_wave() -> u32 {
+    #[cfg(test)]
+    if let Some(lanes) = TEST_HOST_MIN_WAVE.get() {
+        return lanes;
+    }
+    HOST_MIN_WAVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(super) fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -1071,6 +1093,8 @@ pub(super) fn host_max_wave() -> u32 {
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// A test's narrowest host wave, for its thread only ([`set_host_min_wave`] is the process's).
+    pub(super) static TEST_HOST_MIN_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -1286,6 +1310,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        let mut pack32 = false;
         // LDS accesses get a group barrier each (a console wave split in two host waves)
         let mut split_lds = false;
         // with `split_lds`, LDS accesses in lane branches: the blocks every lane runs, and
@@ -1423,7 +1448,11 @@ impl<'a> Lower<'a> {
                 s.lds_dwords += 1;
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
-                s.wave_size = Some(wave);
+                if wave == 32 && host_min_wave() > 32 {
+                    pack32 = true;
+                } else {
+                    s.wave_size = Some(wave);
+                }
             }
         }
         // The title's barriers a thread of the group may never reach, which
@@ -1547,6 +1576,7 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            pack32,
             split_lds,
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
@@ -3986,7 +4016,7 @@ impl<'a> Lower<'a> {
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
-        if !self.console_lanes {
+        if !self.console_lanes || self.pack32 {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
         let [x, y, _] = self.s.threads.expect("compute");
@@ -4241,14 +4271,19 @@ impl<'a> Lower<'a> {
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
         }
-        self.s.op(
+        let lane = self.s.op(
             self.cur,
             "waveGetLaneIndex",
             Attr::ReadOnly,
             self.s.t.i32,
             111,
             &[],
-        )
+        );
+        if self.pack32 {
+            let k31 = self.s.m.i32(31);
+            return self.s.m.bin(self.cur, Bin::And, lane, k31);
+        }
+        lane
     }
 
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
@@ -4310,7 +4345,7 @@ impl<'a> Lower<'a> {
     /// lane's console wave (host waves start at multiples of 64 flat ids,
     /// so host lane % 32 is the console lane). None when they already match.
     fn console_wave_dword(&mut self, at: usize, (x, y): (V, V)) -> Option<V> {
-        if self.s.mesh.is_none() || self.x.native.wave64 {
+        if self.s.mesh.is_none() && !self.pack32 || self.x.native.wave64 {
             return None;
         }
         let i32t = self.s.t.i32;
@@ -4325,7 +4360,7 @@ impl<'a> Lower<'a> {
     /// `v_readfirstlane` in wave32 mesh code: the first active lane of this
     /// lane's console wave, not of the (possibly wave64) host wave.
     fn mesh_read_first(&mut self, a: V) -> Option<V> {
-        if self.s.mesh.is_none() || self.x.native.wave64 {
+        if self.s.mesh.is_none() && !self.pack32 || self.x.native.wave64 {
             return None;
         }
         let c = self.cur;
@@ -4350,6 +4385,19 @@ impl<'a> Lower<'a> {
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
+        let lane = if self.pack32 {
+            // (lane % 32) of this host lane's half: idempotent on host lanes
+            // already in the half
+            let c = self.cur;
+            let i32t = self.s.t.i32;
+            let me = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+            let (k31, not31) = (self.s.m.i32(31), self.s.m.i32(!31));
+            let base = self.s.m.bin(c, Bin::And, me, not31);
+            let low = self.s.m.bin(c, Bin::And, lane, k31);
+            self.s.m.bin(c, Bin::Or, base, low)
+        } else {
+            lane
+        };
         self.s.op(
             self.cur,
             "waveReadLaneAt.i32",

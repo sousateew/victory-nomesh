@@ -451,3 +451,87 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
 }
+
+/// Two console waves of 32 in one group of 64 on a host whose waves are 64 lanes only (no
+/// `WaveSize(32)`): each thread stores its console lane (`v_mbcnt`) and its console wave's
+/// ballot of `t < 40` (`vcc_lo` read as data) at dword 2t and 2t + 1. Run on the host GPU
+/// (any wave size: the halves make it the console's either way).
+#[test]
+fn two_console_waves_of_32_share_a_host_wave_of_64() {
+    let words = [
+        0xD765_0001,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0x7E04_026A, // v_mov_b32 v2, vcc_lo
+        0x3406_0083, // v_lshlrev_b32 v3, 3, v0
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 1 << 8 | 3, // buffer_store_dword v1, v3, s[8:11], 0 offen
+        0x38 << 26 | 0x1C << 18 | 1 << 12 | 4,
+        0x80 << 24 | 2 << 16 | 2 << 8 | 3, // buffer_store_dword v2, v3, s[8:11], 0 offen offset:4
+    ];
+    let mut native = native_of(&words, false, 64);
+    native.used[0].stride = 4;
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let was = (lower::TEST_HOST_WAVE.replace(Some(64)), lower::TEST_HOST_MIN_WAVE.replace(Some(64)));
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        mesh_compute: false,
+    });
+    lower::TEST_HOST_WAVE.set(was.0);
+    lower::TEST_HOST_MIN_WAVE.set(was.1);
+    let lowered = lowered.expect("lower");
+    assert_eq!(lowered.wave_size, None, "no WaveSize on a host of 64-lane waves only");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let (root, pso) = host.compute_pipeline(&shader).expect("the host takes a program without WaveSize");
+    let below = 40u32;
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(128)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    for t in 0..64u32 {
+        let wave = t / 32;
+        let ballot = (0..32).filter(|l| wave * 32 + l < below).fold(0u32, |m, l| m | 1 << l);
+        assert_eq!(out[0][2 * t as usize], t % 32, "console lane of thread {t}");
+        assert_eq!(out[0][2 * t as usize + 1], ballot, "console wave ballot seen by thread {t}");
+    }
+    eprintln!("ran on the hardware device: two console waves of 32 in host waves of 64");
+}
