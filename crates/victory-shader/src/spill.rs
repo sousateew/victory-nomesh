@@ -55,7 +55,7 @@ fn spilled(native: &NativeProgram) -> Option<Vec<(u32, u32)>> {
 }
 
 /// Whether `native` reads its root parameters from a spilled user-data
-/// table. (In Grand Theft Auto VI exactly the compute programs of the
+/// table. (In the game exactly the compute programs of the
 /// console's ray-tracing structure builder do.)
 pub fn is_spilled(native: &NativeProgram) -> bool {
     spilled(native).is_some()

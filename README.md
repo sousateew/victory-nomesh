@@ -1,22 +1,22 @@
 # VIctory on an RX 580 2048SP (Polaris, no mesh shaders, wave64 only)
 
 This repository carries a few changes on top of
-[victory-gta6](https://github.com/fxceless/victory-gta6) so that the Xbox
-Series build of Grand Theft Auto VI runs through VIctory on an AMD Radeon
+[fxceless's fork](https://github.com/fxceless) of VIctory so that
+a 2026 Xbox Series title runs through VIctory on an AMD Radeon
 RX 580 2048SP, an RX 570-class Polaris GPU (DXGI reports "Radeon RX 570
 Series", 8 GB). The driver for this card has no mesh shaders, and its waves
 are always 64 lanes wide (WaveLaneCountMin = Max = 64).
 
 **This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by Rockstar Games or
-Take-Two Interactive.
+copy of the game. It is not affiliated with or endorsed by the
+game's developer or publisher.
 
 ### Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors: the base of everything here.
-- **[victory-gta6](https://github.com/fxceless/victory-gta6)** by fxceless:
-  the fork these changes sit on. Its README follows below, unchanged.
+- **[fxceless](https://github.com/fxceless)**'s fork of VIctory:
+  the fork these changes sit on. Its README follows below.
 - Licensed GPL-3.0-or-later, like both of the above. The full history of both
   is kept.
 - The changes in this repository were developed with
@@ -61,17 +61,17 @@ Optional, pick one:
 
 ---
 
-# victory-gta6
+# fxceless's fork
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), the
-compatibility layer that runs the Xbox Series build of Grand Theft Auto VI
+compatibility layer that runs the Xbox Series build of the game
 natively on Windows from files the user supplies. This fork follows upstream
 `main` and adds fixes aimed at one goal: getting the game's world to render
 correctly and playably on one particular PC.
 
 **This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by Rockstar Games or
-Take-Two Interactive.
+copy of the game. It is not affiliated with or endorsed by the
+game's developer or publisher.
 
 ## Credits
 
@@ -141,7 +141,7 @@ status section describes upstream, not this fork.
 
 # VIctory
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
+Runs an Xbox Series X|S game natively on Windows, from files
 the user supplies.
 
 The title's x86-64 code runs unchanged inside our process; VIctory supplies
