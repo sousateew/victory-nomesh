@@ -1915,6 +1915,90 @@ impl State {
         true
     }
 
+    /// An indirect mesh dispatch on a host without mesh shaders, after
+    /// `prepare_for` bound the fallback's graphics side: the records at host
+    /// address `args` become, per command, a dispatch of the compute half
+    /// and a draw of one instance per group it wrote.
+    fn mesh_fallback_indirect(
+        &mut self,
+        list: &HostList,
+        args: u64,
+        count: Option<u64>,
+        (stride, max): (u32, u32),
+    ) -> bool {
+        /// Record buffer bytes a command may fill; groups past it run empty.
+        const RECORD_BYTES: u64 = 128 << 20;
+        /// Commands past this are not run (two executions each).
+        const COMMANDS: u32 = 4096;
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return false;
+        };
+        let Some(f) = &p.fallback else {
+            return false;
+        };
+        let cap = indirect_fallback().unwrap_or(0);
+        let groups = (RECORD_BYTES / u64::from(f.record_bytes.max(1))).min(u64::from(cap)) as u32;
+        let commands = max.min(COMMANDS);
+        if commands < max {
+            once!(max, "an indirect mesh fallback with more commands than are run");
+        }
+        let (Some(host), Some(dispatch), Some(draw)) =
+            (crate::host::host(), host_signature(2, 32), host_signature(0, 32))
+        else {
+            return false;
+        };
+        if groups == 0 || commands == 0 {
+            return commands == 0;
+        }
+        let slack = u64::from(f.record_bytes) + (1 << 20);
+        let Some((records, gpu)) = host.mesh_records(list, u64::from(groups) * u64::from(f.record_bytes) + slack)
+        else {
+            return false;
+        };
+        let Some(converted) =
+            crate::indirect::mesh_commands(list, args, count, (stride, commands), f.vertices, groups)
+        else {
+            return false;
+        };
+        // The conversion replaced the compute root signature and pipeline.
+        self.host_roots[1] = 0;
+        self.host_pipeline = 0;
+        if !self.bind_as(list, p, &f.root, &f.compute, false, true, 1) {
+            crate::indirect::done(list, &converted);
+            return false;
+        }
+        const UAV: i32 = 0x8;
+        const NON_PIXEL_SHADER_RESOURCE: i32 = 0x40;
+        let barrier = |from: i32, to: i32| {
+            crate::host::transition(&records, D3D12_RESOURCE_STATES(from), D3D12_RESOURCE_STATES(to))
+        };
+        let l = &list.list;
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("mesh fallback indirect {commands} commands {}", p.name));
+        // SAFETY: an open list; the record and command buffers are live and
+        // kept, the graphics arguments set by `prepare_for`.
+        unsafe {
+            l.SetComputeRootUnorderedAccessView(f.uav, gpu);
+            l.SetGraphicsRootShaderResourceView(f.srv, gpu);
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4));
+            for i in 0..u64::from(commands) {
+                l.SetPipelineState(&f.compute);
+                l.ExecuteIndirect(&dispatch, 1, &converted, i * 32, None, 0);
+                l.ResourceBarrier(&[barrier(UAV, NON_PIXEL_SHADER_RESOURCE)]);
+                l.SetPipelineState(&p.pso);
+                l.ExecuteIndirect(&draw, 1, &converted, i * 32 + 16, None, 0);
+                l.ResourceBarrier(&[barrier(NON_PIXEL_SHADER_RESOURCE, UAV)]);
+            }
+        }
+        crate::indirect::done(list, &converted);
+        self.host_pipeline = p.pso.as_raw() as usize;
+        if self.topology != 0 {
+            self.set_topology(list, self.topology);
+        }
+        DRAWN.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
         if compute {
             &self.compute
@@ -2426,6 +2510,29 @@ impl State {
             },
             None => None,
         };
+        if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
+            why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
+            return false;
+        }
+        // A mesh fallback runs its own signatures (a host without mesh
+        // shaders has no mesh signature), without the clamp: the conversion
+        // bounds the group counts itself.
+        if kind == MESH && p.fallback.is_some() {
+            if indirect_fallback().is_none() {
+                why("indirect mesh fallback switched off (VICTORY_MESH_INDIRECT=0)");
+                return false;
+            }
+            args.refresh(list, arguments, len);
+            if let Some((s, at)) = &counter {
+                s.refresh(list, *at, 4);
+            }
+            self.window = None;
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+            let count = counter.as_ref().map(|(s, at)| s.gpu(*at));
+            return self.prepare_for(list, false, true)
+                && self.mesh_fallback_indirect(list, args.gpu(arguments), count, (stride, max));
+        }
         let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
             .then(|| host_signature(kind, stride))
             .flatten()
@@ -2433,10 +2540,6 @@ impl State {
             why("no host signature");
             return false;
         };
-        if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
-            why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
-            return false;
-        }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
         // buffer. Anything else ends the window: it uses the scratch buffer
@@ -2520,9 +2623,7 @@ impl State {
         };
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-            // shortcut: a mesh fallback has no indirect form (its draw needs
-            // the group count as instances), so those dispatches are dropped.
-            MESH => p.fallback.is_none() && self.prepare_for(list, false, true),
+            MESH => self.prepare_for(list, false, true),
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };
@@ -2561,6 +2662,21 @@ impl State {
         }
         true
     }
+}
+
+/// Groups per command of an indirect mesh fallback (`VICTORY_MESH_GROUPS`,
+/// default 65,535), or None with `VICTORY_MESH_INDIRECT=0`: those are
+/// dropped.
+fn indirect_fallback() -> Option<u32> {
+    static CAP: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        if std::env::var("VICTORY_MESH_INDIRECT").is_ok_and(|v| v == "0") {
+            return None;
+        }
+        let cap = std::env::var("VICTORY_MESH_GROUPS").ok().and_then(|v| v.parse().ok()).unwrap_or(65535u32);
+        tracing::info!(groups = cap, "indirect mesh fallback");
+        Some(cap.clamp(1, 65535))
+    })
 }
 
 /// The host command signature for one argument of `kind` with records

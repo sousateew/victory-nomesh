@@ -162,13 +162,18 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    make_source(device, SOURCE)
+}
+
+/// A compute program of ours with its root signature inside, compiled.
+fn make_source(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -406,6 +411,111 @@ fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
             D3D12_RESOURCE_STATE_COMMON,
         )])
     };
+}
+
+/// Turns clamped one-dimensional mesh records into, per command, a
+/// dispatch of the fallback's compute half (12 bytes at 32 i) and a draw of
+/// its records (16 bytes at 32 i + 16): groups past `groups` (what the
+/// record buffer holds) and commands past the title's count run empty.
+const MESH_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=8, b0), SRV(t0), SRV(t1), UAV(u0)"
+cbuffer C : register(b0) { uint stride; uint records; uint vertices; uint groups; uint counted; uint3 unused; };
+ByteAddressBuffer args : register(t0);
+ByteAddressBuffer count : register(t1);
+RWByteAddressBuffer commands : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= records) return;
+    uint3 g = args.Load3(id.x * stride);
+    uint n = min(g.x * g.y * g.z, groups);
+    if (counted != 0 && id.x >= count.Load(0)) n = 0;
+    commands.Store4(id.x * 32, uint4(n, 1, 1, 0));
+    commands.Store4(id.x * 32 + 16, uint4(vertices, n, 0, 0));
+}
+"#;
+
+/// Records, in `list`, the conversion of `records` mesh records `stride`
+/// bytes apart at host address `args` (count at `count`; both read as
+/// shader resources, as [`bound`] reads its sources) into mesh fallback
+/// commands (see [`MESH_SOURCE`]). Returns the command buffer, left as
+/// indirect arguments: the caller returns it with [`done`]. Replaces the
+/// list's compute root signature and pipeline.
+pub(crate) fn mesh_commands(
+    list: &HostList,
+    args: u64,
+    count: Option<u64>,
+    (stride, records): (u32, u32),
+    vertices: u32,
+    groups: u32,
+) -> Option<ID3D12Resource> {
+    static CONVERT: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    let c = CONVERT
+        .get_or_init(|| {
+            let device = &host()?.device;
+            make_source(device, MESH_SOURCE)
+                .inspect_err(|e| tracing::warn!(error = %e, "no mesh command conversion: indirect mesh fallbacks dropped"))
+                .ok()
+        })
+        .as_ref()?;
+    if !args.is_multiple_of(4) || !stride.is_multiple_of(4) || count.is_some_and(|c| !c.is_multiple_of(4)) {
+        return None;
+    }
+    // One buffer for every conversion: submissions run one after another,
+    // and each use moves it COMMON -> UAV -> arguments -> COMMON.
+    static BUFFER: std::sync::Mutex<Option<(ID3D12Resource, u64)>> = std::sync::Mutex::new(None);
+    let mut buffer = BUFFER.lock().unwrap_or_else(|e| e.into_inner());
+    let bytes = u64::from(records) * 32;
+    if buffer.as_ref().is_none_or(|(_, size)| *size < bytes) {
+        let size = bytes.max(64 << 10).next_power_of_two();
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: plain object creation; it starts in the state every use leaves it in.
+        unsafe {
+            host()?
+                .device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut made)
+                .ok()?
+        };
+        *buffer = Some((made?, size));
+    }
+    let (commands, _) = buffer.as_ref()?;
+    list.keep(commands);
+    let l = &list.list;
+    let constants = [stride, records, vertices, groups, u32::from(count.is_some()), 0, 0, 0];
+    // SAFETY: an open list; our root signature, pipeline and live buffers.
+    unsafe {
+        l.ResourceBarrier(&[
+            uav_barrier(),
+            transition(commands, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        ]);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 8, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, args);
+        l.SetComputeRootShaderResourceView(2, count.unwrap_or(args));
+        l.SetComputeRootUnorderedAccessView(3, commands.GetGPUVirtualAddress());
+        l.Dispatch(records.div_ceil(64), 1, 1);
+        l.ResourceBarrier(&[
+            uav_barrier(),
+            transition(commands, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+        ]);
+    }
+    Some(commands.clone())
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -727,6 +837,16 @@ void main() {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    /// The mesh fallback's command conversion compiles and WARP takes its
+    /// root signature and pipeline.
+    #[test]
+    fn warp_mesh_conversion_builds() {
+        let Some(warp) = WarpHarness::new() else {
+            return;
+        };
+        assert!(make_source(&warp.device, MESH_SOURCE).is_ok());
     }
 
     #[test]
