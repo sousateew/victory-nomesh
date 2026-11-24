@@ -848,6 +848,24 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        self.bind_as(list, p, &p.root, &p.pso, compute, compute, usize::MAX)
+    }
+
+    /// [`State::bind`] with `pso` as the pipeline, the title's graphics or
+    /// compute root arguments (`title_compute`) set on the host's graphics
+    /// or compute root signature (`compute`): a mesh fallback's compute half
+    /// gets the mesh stage's graphics arguments.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_as(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        root_signature: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        title_compute: bool,
+        compute: bool,
+        stages: usize,
+    ) -> bool {
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -867,39 +885,39 @@ impl State {
         }
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
-        let tested = if !compute && self.depth_state == DEPTH_READ {
+        let tested = if !title_compute && self.depth_state == DEPTH_READ {
             self.depth
         } else {
             0
         };
         TESTED_DEPTH.set((tested, false));
-        let root = p.root.as_raw() as usize;
+        let root = root_signature.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
             unsafe {
                 if compute {
-                    l.SetComputeRootSignature(&p.root);
+                    l.SetComputeRootSignature(root_signature);
                 } else {
-                    l.SetGraphicsRootSignature(&p.root);
+                    l.SetGraphicsRootSignature(root_signature);
                 }
             }
             self.host_roots[usize::from(compute)] = root;
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
-        if self.host_pipeline != p.pso.as_raw() as usize {
+        if self.host_pipeline != pso.as_raw() as usize {
             // SAFETY: an open list and a live pipeline.
-            unsafe { l.SetPipelineState(&p.pso) };
-            self.host_pipeline = p.pso.as_raw() as usize;
+            unsafe { l.SetPipelineState(pso) };
+            self.host_pipeline = pso.as_raw() as usize;
             list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.keep(pso);
+            list.keep(root_signature);
         }
-        for stage in &p.stages {
+        for stage in p.stages.iter().take(stages) {
             let t = stage.translated();
             STORES.set(t.stores);
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            let made = self.tables(list, &t.used, &t.host.root_indexed_views, title_compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -924,7 +942,7 @@ impl State {
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
-                            self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
+                            self.host_word(title_compute, kind, u.slot, u.dword, memory.as_ref());
                         continue;
                     }
                     let fresh = made
@@ -932,7 +950,7 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None => self.user_value(compute, u.slot, u.root, u.dword),
+                        None => self.user_value(title_compute, u.slot, u.root, u.dword),
                     };
                 }
                 // SAFETY: an open list; `values` covers the parameter.
@@ -979,7 +997,7 @@ impl State {
                         continue;
                     }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
-                    let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                    let Some(&Root::View(address)) = self.roots_ref(title_compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
@@ -1005,7 +1023,7 @@ impl State {
                     };
                     if biased {
                         gpu -= u64::from(self.host_word(
-                            compute,
+                            title_compute,
                             victory_shader::emit::USER_VIEW_BIAS,
                             slot,
                             0,
@@ -1039,7 +1057,7 @@ impl State {
                     }
                     continue;
                 }
-                let address = match self.roots_ref(compute).get(usize::from(slot)) {
+                let address = match self.roots_ref(title_compute).get(usize::from(slot)) {
                     Some(&Root::View(address)) => Some(address),
                     _ => {
                         once!(slot, "a shader writes through a root view the title did not set");
@@ -1802,6 +1820,16 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        let fallback = crate::pipeline::host_pipeline(self.pipeline as This)
+            .is_some_and(|p| p.fallback.is_some());
+        if fallback {
+            if !(self.prepare_for(list, false, true) && self.mesh_fallback(list, x)) {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                dropped(self.pipeline);
+            }
+            return;
+        }
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
@@ -1823,6 +1851,68 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// A mesh dispatch of `x` groups on a host without mesh shaders, after
+    /// `prepare_for` bound the fallback's vertex and pixel pipeline: the
+    /// mesh program runs as compute into the record buffer, then the
+    /// vertex shader draws one instance of its triangles per group.
+    fn mesh_fallback(&mut self, list: &HostList, x: u32) -> bool {
+        /// Records of one dispatch past this are not drawn.
+        const MAX_BYTES: u64 = 1 << 30;
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return false;
+        };
+        let Some(f) = &p.fallback else {
+            return false;
+        };
+        let bytes = u64::from(x) * u64::from(f.record_bytes);
+        if x == 0 || bytes > MAX_BYTES {
+            once!(x, record = f.record_bytes, "a mesh fallback dispatch too large to draw");
+            return x == 0;
+        }
+        let Some(host) = crate::host::host() else {
+            return false;
+        };
+        // Slack past the last group: a lane writing past the program's
+        // vertices must not leave the buffer (root views have no bounds).
+        let Some((records, gpu)) = host.mesh_records(list, bytes + u64::from(f.record_bytes) + (1 << 20)) else {
+            return false;
+        };
+        const UAV: i32 = 0x8;
+        const NON_PIXEL_SHADER_RESOURCE: i32 = 0x40;
+        let barrier = |from: i32, to: i32| {
+            crate::host::transition(&records, D3D12_RESOURCE_STATES(from), D3D12_RESOURCE_STATES(to))
+        };
+        // The compute half: the mesh stage's arguments on the compute root.
+        if !self.bind_as(list, p, &f.root, &f.compute, false, true, 1) {
+            return false;
+        }
+        let l = &list.list;
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| self.op_text(format!("mesh fallback {x}"), false));
+        // SAFETY: an open list; the record buffer is live and kept.
+        unsafe {
+            l.SetComputeRootUnorderedAccessView(f.uav, gpu);
+            l.Dispatch(x, 1, 1);
+            l.ResourceBarrier(&[barrier(UAV, NON_PIXEL_SHADER_RESOURCE)]);
+            l.SetPipelineState(&p.pso);
+        }
+        self.host_pipeline = p.pso.as_raw() as usize;
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("mesh fallback draw {x} x {} vertices {}", f.vertices, p.name));
+        // SAFETY: as above; the graphics arguments were set by `prepare_for`.
+        unsafe {
+            l.SetGraphicsRootShaderResourceView(f.srv, gpu);
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(4));
+            l.DrawInstanced(f.vertices, x, 0, 0);
+            l.ResourceBarrier(&[barrier(NON_PIXEL_SHADER_RESOURCE, UAV)]);
+        }
+        if self.topology != 0 {
+            self.set_topology(list, self.topology);
+        }
+        DRAWN.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -2430,7 +2520,9 @@ impl State {
         };
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
+            // shortcut: a mesh fallback has no indirect form (its draw needs
+            // the group count as instances), so those dispatches are dropped.
+            MESH => p.fallback.is_none() && self.prepare_for(list, false, true),
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };

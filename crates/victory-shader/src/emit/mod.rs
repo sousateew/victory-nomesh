@@ -91,6 +91,9 @@ pub mod host;
 mod lower;
 mod own_bits;
 mod rect;
+mod fallback;
+#[cfg(all(test, windows))]
+mod mesh_tests;
 mod sampler;
 mod shader;
 mod threading;
@@ -112,8 +115,8 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    MEMORY_FAULTS, MEMORY_PAGES, MESH_RECORD_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit,
 };
 
@@ -530,6 +533,92 @@ fn emit_program(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
+    emit_lowered(c, native, p, st, io, res, false).map(|(h, l)| (h, l.wave_size))
+}
+
+/// A mesh program for hosts without mesh shaders: a compute shader (same
+/// bindings as the mesh shader would have, plus the record buffer as `u0`
+/// in [`MESH_RECORD_SPACE`]) that writes one record per group, and a vertex
+/// shader that draws the records (`t0` in that space): a non-indexed,
+/// instanced draw of `3 * max_primitives` vertices, one instance per group.
+#[derive(Debug, Clone)]
+pub struct MeshFallback {
+    pub compute: HostShader,
+    pub vertex: Vec<u8>,
+    /// Bytes of one group's record.
+    pub record_bytes: u32,
+    pub max_primitives: u32,
+}
+
+/// Translates a console mesh program into a [`MeshFallback`] whose vertex
+/// shader's outputs are the inputs `pixel` (a translated pixel shader's
+/// container, if the pipeline has one) declares.
+pub fn translate_mesh_fallback(
+    container: &[u8],
+    pixel: Option<&[u8]>,
+) -> Result<MeshFallback, ShaderError> {
+    let c = Container::parse(container)?;
+    let dxil = c
+        .part(FourCC::DXIL)
+        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let native = crate::native_programs(dxil.data)?
+        .into_iter()
+        .find(|p| p.stage == HwStage::Ms)
+        .ok_or(ShaderError::Unsupported {
+            offset: 0,
+            what: "a container without a mesh program",
+        })?;
+    let p = crate::spill::build(&native)?;
+    let st = structure::structure(&p)?;
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    let io = io::raise(&p, &native)?;
+    lower::take_needs();
+    let (compute, l) = emit_lowered(&c, &native, &p, &st, &io, &res, true)?;
+    let ps_inputs = match pixel {
+        Some(ps) => {
+            let pc = Container::parse(ps)?;
+            match pc.part(FourCC::ISG1) {
+                Some(part) => signature(part.data)?,
+                None => Vec::new(),
+            }
+        }
+        None => Vec::new(),
+    };
+    mesh_fallback_of(compute, &l, &ps_inputs)
+}
+
+/// The fallback of a mesh program lowered as compute (`compute`, `l`) for a
+/// pixel shader reading `ps_inputs`.
+fn mesh_fallback_of(
+    compute: HostShader,
+    l: &lower::Lowered,
+    ps_inputs: &[container::SigElement],
+) -> Result<MeshFallback, ShaderError> {
+    let record = l.record.ok_or(ShaderError::Malformed("no mesh record"))?;
+    let vertex = fallback::vertex_shader(&record, &l.outputs, &l.prims, ps_inputs)
+        .map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
+    Ok(MeshFallback {
+        compute: HostShader {
+            stage: HwStage::Cs,
+            ..compute
+        },
+        vertex,
+        record_bytes: record.dwords() * 4,
+        max_primitives: record.max_primitives,
+    })
+}
+
+/// The translated program and what its lowering left (`mesh_compute`: a mesh
+/// program lowered as the compute half of a [`MeshFallback`]).
+fn emit_lowered(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    mesh_compute: bool,
+) -> Result<(HostShader, lower::Lowered), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -587,7 +676,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let mut l = lower::lower(&lower::Parts {
         native,
         p,
         st,
@@ -597,12 +686,13 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
+        mesh_compute,
     })?;
-    let wave_size = l.wave_size;
-    let shader = HostShader {
+    let dxil = std::mem::take(&mut l.dxil);
+    let host = HostShader {
         stage: native.stage,
-        dxil: l.dxil,
-        user_data: l.user_data,
+        dxil,
+        user_data: std::mem::take(&mut l.user_data),
         static_samplers: l
             .samplers
             .iter()
@@ -615,13 +705,13 @@ fn emit_program(
                 s
             })
             .collect(),
-        samplers: l.samplers,
-        root_cbvs: l.root_cbvs,
-        root_srvs: l.root_srvs,
-        root_uavs: l.root_uavs,
+        samplers: std::mem::take(&mut l.samplers),
+        root_cbvs: std::mem::take(&mut l.root_cbvs),
+        root_srvs: std::mem::take(&mut l.root_srvs),
+        root_uavs: std::mem::take(&mut l.root_uavs),
         root_indexed_views: res.root_indexed_views.clone(),
     };
-    Ok((shader, wave_size))
+    Ok((host, l))
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -1264,6 +1354,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            mesh_compute: false,
         })
         .unwrap();
         let mut dxil = l.dxil;

@@ -50,6 +50,11 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
+    /// A mesh program's record layout when run as compute.
+    pub record: Option<Record>,
+    /// The vertex and primitive outputs as emitted (mesh fallback).
+    pub outputs: Vec<SigElement>,
+    pub prims: Vec<SigElement>,
     /// Bit n: immediate sampler n is used for comparisons.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -78,6 +83,40 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// Mesh: emit a compute shader writing records (see [`Record`]).
+    pub mesh_compute: bool,
+}
+
+/// A mesh program run as compute writes one record per group into the
+/// record UAV, in dwords: the output counts the program requested (m0 of
+/// its `GS_ALLOC_REQ`: vertices | primitives << 12), each primitive's
+/// packed indices (10 bits each, 0 for a culled one), then each vertex's
+/// outputs, then each primitive's outputs, 4 dwords per signature element
+/// (its columns at their place).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Record {
+    pub max_vertices: u32,
+    pub max_primitives: u32,
+    /// Vertex and primitive signature elements.
+    pub outputs: u32,
+    pub prims: u32,
+    /// The program requests its counts, so dword 0 holds them (otherwise
+    /// it is unwritten and the maxima count).
+    pub counts: bool,
+}
+
+impl Record {
+    /// Where primitive 0's packed indices are.
+    pub const INDICES_AT: u32 = 1;
+    pub fn vertices_at(&self) -> u32 {
+        Self::INDICES_AT + self.max_primitives
+    }
+    pub fn prims_at(&self) -> u32 {
+        self.vertices_at() + self.max_vertices * self.outputs * 4
+    }
+    pub fn dwords(&self) -> u32 {
+        self.prims_at() + self.max_primitives * self.prims * 4
+    }
 }
 
 enum Stop {
@@ -227,6 +266,10 @@ struct Lower<'a> {
     console_lanes: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    /// Mesh as compute: the group's record's byte offset (entry block).
+    record_base: Option<V>,
+    /// Mesh: the program sends `GS_ALLOC_REQ` (its output counts).
+    alloc_counts: bool,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// IR blocks whose `s_barrier` not every lane is sure to reach (a lane
@@ -1418,6 +1461,7 @@ impl<'a> Lower<'a> {
             HashSet::new()
         };
         let mut no_barrier = HashSet::new();
+        let mut alloc_counts = false;
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             s.threads = Some([ms.threads, 1, 1]);
@@ -1427,6 +1471,7 @@ impl<'a> Lower<'a> {
                 max_primitives: ms.max_primitives,
                 topology: ms.topology,
             });
+            s.as_compute = x.mesh_compute;
             // Barriers order the lanes' LDS accesses; the console's
             // allocation request needs them too, but the host does not. One
             // lane sends that request, and what it dominates (the path for
@@ -1446,6 +1491,7 @@ impl<'a> Lower<'a> {
                     })
                 })
                 .collect();
+            alloc_counts = !alloc.is_empty();
             for &b in &order {
                 let mut d = b;
                 let dominated = loop {
@@ -1522,6 +1568,8 @@ impl<'a> Lower<'a> {
             halves,
             wave_base: None,
             flat: None,
+            record_base: None,
+            alloc_counts,
             no_barrier,
             fence_only,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -2114,8 +2162,13 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        let record = self.record();
+        let (outputs, prims) = (self.s.outputs.clone(), self.s.prims.clone());
         Ok(Lowered {
             wave_size,
+            record,
+            outputs,
+            prims,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -2981,7 +3034,9 @@ impl<'a> Lower<'a> {
                     .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
                 self.s.flags |= flags::WAVE_OPS;
                 let mut xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
-                if self.exchange.is_some() {
+                if let Some(d) = self.console_wave_dword(at, xy) {
+                    xy.0 = d;
+                } else if self.exchange.is_some() {
                     // a host wave's ballot is its half's 32 bits: the halves exchange them
                     let b = self.def_block.get(&lo).copied();
                     if self.local {
@@ -4026,10 +4081,29 @@ impl<'a> Lower<'a> {
             self.s.m.i32(mesh.max_vertices),
             self.s.m.i32(mesh.max_primitives),
         );
-        self.s
-            .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
+        if !self.s.as_compute {
+            self.s
+                .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
+        }
         let flat = self.mesh_thread();
         let z = self.s.m.i32(0);
+        if self.s.as_compute {
+            // Every primitive slot of the record starts culled (0), also
+            // those past the lanes (the buffer holds earlier draws' records).
+            for k in 0..mesh.max_primitives.div_ceil(threads) {
+                let c = self.cur;
+                let first = self.s.m.i32(k * threads);
+                let slot = self.s.m.bin(c, Bin::Add, flat, first);
+                let guard = ((k + 1) * threads > mesh.max_primitives)
+                    .then(|| self.s.m.cmp(c, pred::IULT, slot, p));
+                let at = self.begin_guarded(guard);
+                let one = self.s.m.i32(Record::INDICES_AT);
+                let dword = self.s.m.bin(self.cur, Bin::Add, slot, one);
+                self.record_store(dword, z);
+                self.end_guarded(at, &[]);
+            }
+            return Ok(());
+        }
         // Every primitive of the declared count starts culled, also those
         // past the lanes (a count of 256 with 128 lanes): lane n culls
         // primitives n, n + lanes, ... The host draws all it was promised,
@@ -4057,6 +4131,82 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
         }
         Ok(())
+    }
+
+    /// Mesh as compute: `GS_ALLOC_REQ`'s counts (m0) into the record's
+    /// dword 0, for the vertex shader to leave out the primitives past them
+    /// (the console ignores those lanes' exports).
+    fn record_counts(&mut self, inst: &Inst) -> Result<(), Why> {
+        let m0 = inst.read(Reg::S(crate::ir::M0)).ok_or("an unread m0")?;
+        let m0 = self.i32_of(m0)?;
+        let z = self.s.m.i32(0);
+        self.record_store(z, m0);
+        Ok(())
+    }
+
+    /// Mesh as compute: the record layout.
+    fn record(&self) -> Option<Record> {
+        let mesh = self.s.mesh.filter(|_| self.s.as_compute)?;
+        Some(Record {
+            max_vertices: mesh.max_vertices,
+            max_primitives: mesh.max_primitives,
+            outputs: self.s.outputs.len() as u32,
+            prims: self.s.prims.len() as u32,
+            counts: self.alloc_counts,
+        })
+    }
+
+    /// Mesh as compute: stores `x` (an i32) at dword `dword` of the group's
+    /// record.
+    fn record_store(&mut self, dword: V, x: V) {
+        let base = match self.record_base {
+            Some(b) => b,
+            None => {
+                let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+                    unreachable!()
+                };
+                let bytes = self
+                    .s
+                    .m
+                    .i32(self.record().expect("mesh as compute").dwords() * 4);
+                let b = self.s.m.bin(self.s.entry, Bin::Mul, g, bytes);
+                self.record_base = Some(b);
+                b
+            }
+        };
+        let h = self.s.record_uav_handle();
+        let c = self.cur;
+        let four = self.s.m.i32(4);
+        let off = self.s.m.bin(c, Bin::Mul, dword, four);
+        let off = self.s.m.bin(c, Bin::Add, base, off);
+        let iu = self.s.m.undef(self.s.t.i32);
+        let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+        let void = self.s.t.void;
+        self.s.op(
+            c,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[h, off, iu, x, iu, iu, iu, mask, align],
+        );
+    }
+
+    /// Mesh as compute: the record dword of output element `id`, column
+    /// `col`, of the lane's vertex or primitive.
+    fn record_output(&mut self, primitive: bool, id: usize, col: u8) -> V {
+        let r = self.record().expect("mesh as compute");
+        let (at, n) = if primitive {
+            (r.prims_at(), r.prims)
+        } else {
+            (r.vertices_at(), r.outputs)
+        };
+        let lane = self.mesh_thread();
+        let c = self.cur;
+        let stride = self.s.m.i32(n * 4);
+        let d = self.s.m.bin(c, Bin::Mul, lane, stride);
+        let k = self.s.m.i32(at + id as u32 * 4 + u32::from(col));
+        self.s.m.bin(c, Bin::Add, d, k)
     }
 
     /// Mesh: the thread's index in the group, which is its vertex and
@@ -4153,6 +4303,50 @@ impl<'a> Lower<'a> {
         let lane = self.s.m.select(c, any, lane, me);
         let at = self.read_lane(x, lane);
         (self.s.m.select(c, any, at, first), any)
+    }
+
+    /// Mesh code (no `WaveSize` in SM 6.6) from a wave32 console on a
+    /// wave64 host: of a host ballot's dwords `xy`, the one holding this
+    /// lane's console wave (host waves start at multiples of 64 flat ids,
+    /// so host lane % 32 is the console lane). None when they already match.
+    fn console_wave_dword(&mut self, at: usize, (x, y): (V, V)) -> Option<V> {
+        if self.s.mesh.is_none() || self.x.native.wave64 {
+            return None;
+        }
+        let i32t = self.s.t.i32;
+        let lane = self
+            .s
+            .op(at, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let k32 = self.s.m.i32(32);
+        let low = self.s.m.cmp(at, pred::IULT, lane, k32);
+        Some(self.s.m.select(at, low, x, y))
+    }
+
+    /// `v_readfirstlane` in wave32 mesh code: the first active lane of this
+    /// lane's console wave, not of the (possibly wave64) host wave.
+    fn mesh_read_first(&mut self, a: V) -> Option<V> {
+        if self.s.mesh.is_none() || self.x.native.wave64 {
+            return None;
+        }
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let on = self.s.m.bool(true);
+        let r = self
+            .s
+            .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+        let xy = (self.s.m.extract(c, r, 0), self.s.m.extract(c, r, 1));
+        let d = self.console_wave_dword(c, xy)?;
+        let first = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[d]);
+        let lane = self
+            .s
+            .op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let k = self.s.m.i32(!31);
+        let base = self.s.m.bin(c, Bin::And, lane, k);
+        let at = self.s.m.bin(c, Bin::Add, base, first);
+        Some(self.read_lane(a, at))
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
@@ -4649,6 +4843,13 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
                 Ok(())
+            }
+            Fields::Sopp { imm }
+                if self.s.as_compute
+                    && name == "s_sendmsg"
+                    && imm & 0xF == GS_ALLOC_REQ =>
+            {
+                self.record_counts(inst)
             }
             Fields::Sopp { .. } => Ok(()),
             Fields::Smem { .. } => self.smem(inst, (b, i)),
@@ -7272,6 +7473,9 @@ impl<'a> Lower<'a> {
             }
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
+                if let Some(r) = self.mesh_read_first(a) {
+                    return int(self, r);
+                }
                 let (mine, any) = self.first_lane(a, guard);
                 // two host waves that exchange: the console's first lane may be in the other
                 // one, unless every lane holds the same value
@@ -10115,6 +10319,23 @@ impl<'a> Lower<'a> {
             self.s
                 .op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
         }
+        // A record holds `max_vertices` vertices and `max_primitives`
+        // primitives: lanes past them (whose exports the console's counts
+        // ignore) must not write into the next group's record.
+        let guard = match self.s.mesh.filter(|_| self.s.as_compute) {
+            Some(m) => {
+                let per_primitive = matches!(e.target, Target::Primitive | Target::PrimitiveParam { .. });
+                let limit = if per_primitive { m.max_primitives } else { m.max_vertices };
+                let lane = self.mesh_thread();
+                let k = self.s.m.i32(limit);
+                let inside = self.s.m.cmp(c, pred::IULT, lane, k);
+                Some(match guard {
+                    Some(g) => self.s.m.bin(c, Bin::And, g, inside),
+                    None => inside,
+                })
+            }
+            None => guard,
+        };
         if mesh && e.target == Target::Primitive {
             return self.emit_indices(e, guard);
         }
@@ -10293,8 +10514,14 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
                 x = self.as_int(f);
             }
+            elements(self, primitive)[id].usage |= 1 << col;
+            if mesh && self.s.as_compute {
+                // The value's bits, at the element's place in the record.
+                let at = self.record_output(primitive, id, col);
+                self.record_store(at, x);
+                continue;
+            }
             let el = &mut elements(self, primitive)[id];
-            el.usage |= 1 << col;
             let (suffix, x) = match el.comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
@@ -10372,6 +10599,17 @@ impl<'a> Lower<'a> {
                 culled = self.s.m.bin(c, Bin::Or, culled, past);
             }
             *slot = i;
+        }
+        if self.s.as_compute {
+            // The record's primitive slot: the packed indices, 0 when culled.
+            let mask = self.s.m.i32(0x3FFF_FFFF);
+            let packed = self.s.m.bin(c, Bin::And, x, mask);
+            let packed = self.s.m.select(c, culled, z, packed);
+            let one = self.s.m.i32(Record::INDICES_AT);
+            let dword = self.s.m.bin(c, Bin::Add, flat, one);
+            self.record_store(dword, packed);
+            self.end_guarded(at, &[]);
+            return Ok(());
         }
         let mut args = vec![flat];
         for i in indices {
@@ -10893,6 +11131,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            mesh_compute: false,
         })
         .map(|_| ())
     }
@@ -10943,6 +11182,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            mesh_compute: false,
         })
     }
 
@@ -11054,6 +11294,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            mesh_compute: false,
         }).unwrap();
 
         let container =

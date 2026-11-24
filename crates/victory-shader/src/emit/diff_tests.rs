@@ -770,6 +770,7 @@ fn translated_shaders_draw_as_pc_ones() {
         stride: 24,
         size: (16, 16),
         mesh_groups: 0,
+        fallback: None,
     };
     let mut failures = Vec::new();
     let only = std::env::var("VICTORY_DIFF_ONLY").ok();
@@ -889,6 +890,7 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
         stride: 0,
         size: (16, 16),
         mesh_groups,
+        fallback: None,
     };
     let mut failures = Vec::new();
     let only = std::env::var("VICTORY_DIFF_ONLY").ok();

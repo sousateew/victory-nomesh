@@ -523,7 +523,7 @@ fn check(
                     .failed
                     .get(&format!("validator: {first}"))
                     .map_or(0, |f| f.0);
-                if n < 3 {
+                if n < 400 {
                     let name = format!(
                         "{dir}/{}_{n}",
                         first

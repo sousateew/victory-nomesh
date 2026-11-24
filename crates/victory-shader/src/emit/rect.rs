@@ -464,6 +464,7 @@ mod tests {
                     stride: 32,
                     size: (8, 8),
                     mesh_groups: 0,
+                    fallback: None,
                 };
                 host.draw(&root, &pso, &d).unwrap()
             };

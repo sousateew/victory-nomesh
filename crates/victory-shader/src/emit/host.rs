@@ -128,6 +128,25 @@ impl Host {
         &self,
         stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
     ) -> Result<ID3D12RootSignature, String> {
+        self.root_signature_with(stages, None).map(|(r, _)| r)
+    }
+
+    /// [`Host::root_signature_for`] plus a mesh fallback's record buffer
+    /// (`u0`, or with `srv` `t0`, in [`super::MESH_RECORD_SPACE`]) as the
+    /// last root parameter, whose index comes back with it.
+    pub fn root_signature_with_record(
+        &self,
+        stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
+        srv: bool,
+    ) -> Result<(ID3D12RootSignature, u32), String> {
+        self.root_signature_with(stages, Some(srv))
+    }
+
+    fn root_signature_with(
+        &self,
+        stages: &[(&HostShader, D3D12_SHADER_VISIBILITY)],
+        record_srv: Option<bool>,
+    ) -> Result<(ID3D12RootSignature, u32), String> {
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = stages
             .iter()
             .map(|&(s, vis)| D3D12_ROOT_PARAMETER1 {
@@ -164,6 +183,24 @@ impl Host {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                         ShaderRegister: u32::from(slot),
                         RegisterSpace: super::ROOT_CBV_SPACE,
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            });
+        }
+        let record = params.len() as u32;
+        if let Some(srv) = record_srv {
+            params.push(D3D12_ROOT_PARAMETER1 {
+                ParameterType: if srv {
+                    D3D12_ROOT_PARAMETER_TYPE_SRV
+                } else {
+                    D3D12_ROOT_PARAMETER_TYPE_UAV
+                },
+                Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        ShaderRegister: 0,
+                        RegisterSpace: super::MESH_RECORD_SPACE,
                         Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                     },
                 },
@@ -216,7 +253,8 @@ impl Host {
                 blob.GetBufferPointer().cast::<u8>(),
                 blob.GetBufferSize(),
             );
-            self.device.CreateRootSignature(0, bytes).map_err(err)
+            let root = self.device.CreateRootSignature(0, bytes).map_err(err)?;
+            Ok((root, record))
         }
     }
 
@@ -619,6 +657,22 @@ pub struct Draw<'a> {
     pub size: (u32, u32),
     /// Mesh thread groups to dispatch instead of drawing (0: draw).
     pub mesh_groups: u32,
+    /// Draw the `mesh_groups` through a mesh fallback instead: its compute
+    /// half runs first, then the pipeline draws its records.
+    pub fallback: Option<Fallback<'a>>,
+}
+
+/// A mesh fallback's compute half for [`Draw`], and where the record
+/// buffer goes: `uav` in `root`, `srv` in the draw's root signature.
+#[cfg(test)]
+pub struct Fallback<'a> {
+    pub root: &'a ID3D12RootSignature,
+    pub pso: &'a ID3D12PipelineState,
+    pub uav: u32,
+    pub srv: u32,
+    pub record_bytes: u32,
+    /// Vertices drawn per group.
+    pub vertices: u32,
 }
 
 #[cfg(test)]
@@ -821,7 +875,34 @@ impl Host {
                 Some(vb)
             };
             list.SetDescriptorHeaps(&[Some(views.clone()), Some(sampler_heap.clone())]);
+            let records = match &d.fallback {
+                Some(f) => {
+                    let mut desc = buf_desc(u64::from(f.record_bytes * d.mesh_groups.max(1)));
+                    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                    let records = make(
+                        D3D12_HEAP_TYPE_DEFAULT,
+                        &desc,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        None,
+                    )?;
+                    list.SetComputeRootSignature(f.root);
+                    list.SetPipelineState(f.pso);
+                    list.SetComputeRootUnorderedAccessView(f.uav, records.GetGPUVirtualAddress());
+                    list.Dispatch(d.mesh_groups, 1, 1);
+                    list.ResourceBarrier(&[transition(
+                        &records,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    )]);
+                    list.SetPipelineState(pso);
+                    Some(records)
+                }
+                None => None,
+            };
             list.SetGraphicsRootSignature(root);
+            if let (Some(f), Some(r)) = (&d.fallback, &records) {
+                list.SetGraphicsRootShaderResourceView(f.srv, r.GetGPUVirtualAddress());
+            }
             for (param, arg) in &d.roots {
                 match arg {
                     Root::Constants(data) => list.SetGraphicsRoot32BitConstants(
@@ -866,7 +947,9 @@ impl Host {
                     }]),
                 );
             }
-            if d.mesh_groups > 0 {
+            if let Some(f) = &d.fallback {
+                list.DrawInstanced(f.vertices, d.mesh_groups, 0, 0);
+            } else if d.mesh_groups > 0 {
                 let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
                 list6.DispatchMesh(d.mesh_groups, 1, 1);
             } else {
@@ -935,7 +1018,7 @@ impl Host {
                 out.extend_from_slice(row);
             }
             readback.Unmap(0, None);
-            drop(keep);
+            drop((keep, records));
             Ok(out)
         }
     }

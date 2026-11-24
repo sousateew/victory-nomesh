@@ -6095,6 +6095,63 @@ impl Host {
         Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
     }
 
+    /// The mesh fallback's record buffer (GPU memory, shader-writable), at
+    /// least `bytes` long, and its host address; `list` keeps it alive.
+    /// Every fallback draw uses its start: submissions run one after another
+    /// and each draw moves it UAV → SRV → UAV around its two halves, so the
+    /// next draw's writes wait for this one's reads.
+    pub(crate) fn mesh_records(&self, list: &HostList, bytes: u64) -> Option<(ID3D12Resource, u64)> {
+        static RECORDS: Mutex<Option<(ID3D12Resource, u64)>> = Mutex::new(None);
+        let mut records = RECORDS.lock().unwrap_or_else(|e| e.into_inner());
+        if records.as_ref().is_none_or(|(_, size)| *size < bytes) {
+            let size = bytes.max(16 << 20).next_power_of_two();
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: plain object creation. It starts as a UAV, the state
+            // every fallback draw leaves it in.
+            let made = unsafe {
+                self.device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    None,
+                    &mut buffer,
+                )
+            };
+            match (made, buffer) {
+                (Ok(()), Some(b)) => {
+                    name(&b, || format!("mesh fallback records {size:#x}"));
+                    tracing::info!(size, "mesh fallback record buffer");
+                    *records = Some((b, size));
+                }
+                (e, _) => {
+                    tracing::warn!(error = ?e.err(), size, "no mesh fallback record buffer");
+                    return None;
+                }
+            }
+        }
+        let (buffer, _) = records.as_ref()?;
+        list.keep(buffer);
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some((buffer.clone(), gpu))
+    }
+
     /// A buffer in system memory that the CPU maps (write-back, so reading
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in

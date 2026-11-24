@@ -170,6 +170,22 @@ impl Shader {
             })
             .as_ref()
     }
+
+    /// This mesh shader as compute plus a vertex shader, for hosts without
+    /// mesh shaders; its vertices carry what `pixel` (a translated pixel
+    /// shader) reads.
+    pub(crate) fn mesh_fallback(
+        &self,
+        pixel: Option<&[u8]>,
+    ) -> Option<victory_shader::emit::MeshFallback> {
+        match victory_shader::emit::translate_mesh_fallback(&self.container, pixel) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                tracing::warn!(hash = %self.hash, error = %e, "mesh shader has no fallback; its draws are dropped");
+                None
+            }
+        }
+    }
 }
 
 #[cfg(windows)]

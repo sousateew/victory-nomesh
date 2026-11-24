@@ -12,6 +12,11 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// Where a mesh fallback's record buffer is bound: `u0` (written by the
+/// mesh program run as compute) and `t0` (read by its vertex shader).
+pub const MESH_RECORD_SPACE: u32 = 2;
+/// The `root_srvs` entry standing for the record buffer's `t0`.
+pub(crate) const RECORD_SRV_SLOT: u8 = u8::MAX;
 
 /// The root SRV `t<SLOT_STRIDES>` in [`ROOT_CBV_SPACE`] of a shader that
 /// reads buffers through descriptors it picks from the view heap at an
@@ -136,6 +141,11 @@ pub(crate) struct Shader {
     pub mesh: Option<Mesh>,
     /// A geometry shader (the rectangle stage, `rect.rs`); `pixel` is false.
     pub geometry: Option<Geometry>,
+    /// The mesh program is emitted as a compute shader that writes its
+    /// vertices and primitives into the record UAV ([`MESH_RECORD_SPACE`])
+    /// instead (hosts without mesh shaders).
+    pub as_compute: bool,
+    record_uav: Option<V>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -199,6 +209,8 @@ impl Shader {
             prims: Vec::new(),
             mesh: None,
             geometry: None,
+            as_compute: false,
+            record_uav: None,
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
@@ -346,6 +358,57 @@ impl Shader {
         h
     }
 
+    /// The handle of the mesh record buffer (`u0` in [`MESH_RECORD_SPACE`],
+    /// a raw UAV), made in the entry block.
+    pub fn record_uav_handle(&mut self) -> V {
+        if let Some(h) = self.record_uav {
+            return h;
+        }
+        let z = self.m.i32(0);
+        let bind = [z, z, self.m.i32(MESH_RECORD_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, z, f],
+        );
+        // Raw buffer (11), UAV (bit 12).
+        let h = self.annotate(block, h, 11 | 0x1000, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.record_uav = Some(h);
+        h
+    }
+
+    /// The handle of the record buffer read by the fallback vertex shader
+    /// (`t0` in [`MESH_RECORD_SPACE`], a raw SRV), made in the entry block.
+    pub fn record_srv_handle(&mut self) -> V {
+        if let Some(&(_, h)) = self.root_srvs.iter().find(|r| r.0 == RECORD_SRV_SLOT) {
+            return h;
+        }
+        let z = self.m.i32(0);
+        let bind = [z, z, self.m.i32(MESH_RECORD_SPACE), self.m.i8(0)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, z, f],
+        );
+        let h = self.annotate(block, h, 11, 0);
+        self.flags |= flags::RAW_BUFFERS;
+        self.root_srvs.push((RECORD_SRV_SLOT, h));
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -435,6 +498,13 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        if self.as_compute {
+            // A compute shader: no signatures, no mesh state.
+            self.mesh = None;
+            self.inputs.clear();
+            self.outputs.clear();
+            self.prims.clear();
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         let mut resources = None;
@@ -448,6 +518,7 @@ impl Shader {
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || !self.root_uavs.is_empty()
+            || self.record_uav.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -510,12 +581,17 @@ impl Shader {
                 let u = self.m.undef(p);
                 let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
+                    let (space, register) = if slot == RECORD_SRV_SLOT {
+                        (MESH_RECORD_SPACE, 0)
+                    } else {
+                        (ROOT_CBV_SPACE, u32::from(slot))
+                    };
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
                         Some(self.m.md_value(u)),
                         Some(empty),
-                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
-                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, space)),
+                        Some(i32c(&mut self, register)),
                         Some(i32c(&mut self, 1)),
                         Some(i32c(&mut self, 11)),
                         Some(i32c(&mut self, 0)),
@@ -524,15 +600,15 @@ impl Shader {
                     list.push(Some(self.m.md_node(ops)));
                     bindings.push(Binding {
                         kind: 4,
-                        space: ROOT_CBV_SPACE,
-                        register: u32::from(slot),
+                        space,
+                        register,
                         dxil_kind: 11,
                     });
                 }
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() {
+            if !self.root_uavs.is_empty() || self.record_uav.is_some() {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -563,6 +639,29 @@ impl Shader {
                         kind: 7,
                         space: ROOT_CBV_SPACE,
                         register: u32::from(slot),
+                        dxil_kind: 11,
+                    });
+                }
+                if self.record_uav.is_some() {
+                    // The mesh fallback's record buffer, after the root UAVs.
+                    let ops = vec![
+                        Some(i32c(&mut self, list.len() as u32)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, MESH_RECORD_SPACE)),
+                        Some(i32c(&mut self, 0)),
+                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, 11)),
+                        Some(no),
+                        Some(no),
+                        Some(no),
+                        None,
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+                    bindings.push(Binding {
+                        kind: 7,
+                        space: MESH_RECORD_SPACE,
+                        register: 0,
                         dxil_kind: 11,
                     });
                 }
@@ -610,7 +709,7 @@ impl Shader {
             self.m.named_md("dx.resources", vec![r]);
         }
 
-        let graphics = self.threads.is_none() || self.mesh.is_some();
+        let graphics = !self.as_compute && (self.threads.is_none() || self.mesh.is_some());
         if graphics {
             // shortcut: every output is declared to depend on every input; the
             // exact sets need a dependence pass. Drivers read this state.
